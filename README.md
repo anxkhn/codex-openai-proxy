@@ -190,6 +190,7 @@ curl -sS "$BASE_URL/v1/responses" \
   -H "Authorization: Bearer placeholder" \
   -d '{
     "model": "gpt-5",
+    "instructions": "You are a helpful assistant.",
     "input": "Explain PKCE in 3 bullet points"
   }'
 ```
@@ -237,6 +238,22 @@ Environment variables:
 - `CODEX_PROXY_MODELS_CLIENT_VERSION` (default `1.0.0`)
 - `CODEX_PROXY_UPSTREAM_VERSION` (default detected from local `codex --version`, fallback `0.0.0`)
 - `CODEX_PROXY_USER_AGENT` (default Codex-like `codex_cli_rs/<version> (...)` string)
+- `CODEX_PROXY_AUTO_DEFAULT_INSTRUCTIONS` (default `false`; if enabled, injects fallback `instructions` for `/v1/responses` when absent)
+
+## OpenAI compliance note on `instructions`
+
+`instructions` is a valid field on the OpenAI **Responses API** (`POST /v1/responses`).
+
+- It is not a `chat/completions` field.
+- This proxy auto-converts `input` values (string/object) into the list format required by Codex upstream.
+- For Codex upstream compatibility, the proxy enforces `store=false` on `/v1/responses` and uses upstream streaming internally.
+- If client `stream` is `false`, the proxy aggregates upstream SSE and returns JSON.
+- Strict pass-through for missing `instructions` is the default.
+- If you want a fallback instruction automatically added, set:
+
+```bash
+export CODEX_PROXY_AUTO_DEFAULT_INSTRUCTIONS=true
+```
 
 ## File layout
 
@@ -304,4 +321,21 @@ Smoke run:
 
 ```bash
 uv run codex-openai-proxy --help
+```
+
+## Official SDK smoke apps
+
+Compatibility smoke scripts live in `examples/openai-sdk-smoke`.
+
+Python official SDK:
+
+```bash
+BASE_URL="http://127.0.0.1:8787/v1" uv run --with openai python examples/openai-sdk-smoke/python_smoke.py
+```
+
+JavaScript official SDK:
+
+```bash
+npm --prefix examples/openai-sdk-smoke install
+BASE_URL="http://127.0.0.1:8787/v1" npm --prefix examples/openai-sdk-smoke run smoke:js
 ```
