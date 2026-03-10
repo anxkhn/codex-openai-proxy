@@ -1,0 +1,11 @@
+{
+  "name": "openai-sdk-smoke",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke:js": "node node_smoke.mjs"
+  },
+  "dependencies": {
+    "openai": "^4.104.0"
+  }
+}
