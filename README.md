@@ -152,6 +152,8 @@ open http://127.0.0.1:8787/redoc
 
 ## OpenAI Python SDK example
 
+Both `chat.completions` and `responses` work:
+
 ```python
 from openai import OpenAI
 
@@ -160,11 +162,22 @@ client = OpenAI(
     api_key="placeholder-not-used",
 )
 
+# Chat Completions (most compatible with existing apps)
+resp = client.chat.completions.create(
+    model="gpt-5.4",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Write a tiny Python function that reverses a string."},
+    ],
+)
+print(resp.choices[0].message.content)
+
+# Responses API (native Codex format)
 resp = client.responses.create(
     model="gpt-5",
+    instructions="You are a helpful assistant.",
     input="Write a tiny Python function that reverses a string.",
 )
-
 print(resp.output_text)
 ```
 
@@ -240,6 +253,53 @@ Environment variables:
 - `CODEX_PROXY_USER_AGENT` (default Codex-like `codex_cli_rs/<version> (...)` string)
 - `CODEX_PROXY_AUTO_DEFAULT_INSTRUCTIONS` (default `false`; if enabled, injects fallback `instructions` for `/v1/responses` when absent)
 
+## Chat Completions compatibility
+
+`POST /v1/chat/completions` is fully compatible with the OpenAI Python and JavaScript SDKs.
+
+The Codex upstream only exposes `POST /v1/responses`. The proxy converts transparently:
+
+- `messages` array -- system role becomes `instructions`, the rest become `input`
+- Response converted back to `chat.completion` format with `choices`, `usage` (`prompt_tokens`/`completion_tokens`/`total_tokens`)
+- Streaming supported (`stream: true`) -- re-emitted as `chat.completion.chunk` SSE
+- Multi-turn context works -- include the full message history in each request as normal
+
+**Unsupported parameters** (`temperature`, `max_tokens`, `top_p`, `presence_penalty`, `frequency_penalty`, `seed`, `n`, `stop`) are accepted by the proxy but not forwarded to the upstream. A warning is logged per request:
+
+```
+temperature=0.7 not supported by Codex backend -- parameter ignored
+```
+
+**`response_format={"type":"json_object"}`** is handled by injecting a JSON instruction into the system prompt instead of passing the parameter upstream:
+
+```
+response_format=json_object not supported by Codex backend -- injecting JSON instruction into prompt instead
+```
+
+## Vision / image support
+
+`image_url` content parts with base64 data URLs work end-to-end:
+
+```python
+import base64
+
+with open("image.png", "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+
+resp = client.chat.completions.create(
+    model="gpt-5.4",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What color is dominant in this image?"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ],
+    }],
+)
+```
+
+Only base64 data URLs are supported. Remote URLs are passed through as-is (support depends on Codex upstream).
+
 ## OpenAI compliance note on `instructions`
 
 `instructions` is a valid field on the OpenAI **Responses API** (`POST /v1/responses`).
@@ -254,6 +314,20 @@ Environment variables:
 ```bash
 export CODEX_PROXY_AUTO_DEFAULT_INSTRUCTIONS=true
 ```
+
+## Testing
+
+Integration tests run against a live proxy instance:
+
+```bash
+# Start the proxy first
+uv run codex-openai-proxy serve --port 8787
+
+# Run tests (requires authenticated proxy)
+uv run pytest tests/ -v
+```
+
+Tests cover: models endpoint, single-turn responses, system messages, multi-turn context retention, JSON mode, unsupported parameter handling, base64 image understanding, and image context in follow-up messages.
 
 ## File layout
 
@@ -274,6 +348,8 @@ codex-openai-proxy/
     codex/
       client.py
       rate_limits.py
+  tests/
+    test_integration.py
 ```
 
 ## Security notes
