@@ -300,6 +300,42 @@ resp = client.chat.completions.create(
 
 Only base64 data URLs are supported. Remote URLs are passed through as-is (support depends on Codex upstream).
 
+## Known limitations
+
+These limitations stem from the Codex upstream (`https://chatgpt.com/backend-api/codex`), not the proxy itself.
+
+### Unsupported parameters (accepted but ignored)
+
+The following OpenAI parameters are accepted by the proxy for SDK compatibility but are **not forwarded** to Codex. A warning is logged for each:
+
+| Parameter | Notes |
+|-----------|-------|
+| `temperature` | Codex controls sampling internally |
+| `max_tokens` | No token cap exposed by upstream |
+| `top_p` | Not supported |
+| `presence_penalty` | Not supported |
+| `frequency_penalty` | Not supported |
+| `seed` | Not supported |
+| `n` | Always returns 1 completion |
+| `stop` | Not supported |
+| `logprobs` / `top_logprobs` | Not supported |
+
+### `response_format`
+
+`response_format={"type":"json_object"}` is handled by injecting a JSON instruction into the system prompt. The upstream does not support a native JSON mode.
+
+### Images: base64 only
+
+`image_url` content parts **must** use base64 data URLs (`data:image/...;base64,...`). Remote HTTP/HTTPS URLs are passed through as-is, but Codex upstream support for remote URLs is not guaranteed. The proxy logs a warning when a non-base64 URL is detected.
+
+### No fine-tuning or embeddings
+
+`POST /v1/embeddings` and fine-tuning endpoints are not implemented. The proxy targets chat/generation use cases only.
+
+### Single-tenant / localhost only
+
+This proxy holds a single OAuth session and is designed for local personal use. It is not multi-tenant and should not be exposed to the public internet.
+
 ## OpenAI compliance note on `instructions`
 
 `instructions` is a valid field on the OpenAI **Responses API** (`POST /v1/responses`).

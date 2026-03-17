@@ -128,11 +128,9 @@ class TestJsonMode:
 # Image understanding
 # ---------------------------------------------------------------------------
 
-# Valid 4x4 solid red PNG (generated: make_png(4, 4, 255, 0, 0))
-_RED_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGP4z8AARwzEcQCukw/x0F8jngAAAABJRU5ErkJggg=="
-
-# Valid 4x4 solid blue PNG (generated: make_png(4, 4, 0, 0, 255))
-_BLUE_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGL4z8BQDwAEhAF/VualIQAAAABJRU5ErkJggg=="
+# Valid 32x32 solid red PNG (generated: make_png(32, 32, 255, 0, 0))
+# Larger size ensures the model reliably identifies the color.
+_RED_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg=="
 
 
 class TestImageUnderstanding:

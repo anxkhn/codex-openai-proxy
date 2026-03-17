@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any
 import json
+import logging
 
 from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -12,6 +13,8 @@ from codex_openai_proxy.auth.store import AuthStore
 from codex_openai_proxy.codex.client import CodexUpstreamClient, iter_streaming_body
 from codex_openai_proxy.codex.rate_limits import RateLimitState
 from codex_openai_proxy.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_RESPONSES_BODY: dict[str, Any] = {
     "model": "gpt-5",
@@ -99,8 +102,6 @@ def _adapt_responses_body(
 
 def _chat_completions_to_responses(body: dict[str, Any]) -> dict[str, Any]:
     """Convert Chat Completions request to Responses API format for upstream."""
-    import logging
-    logger = logging.getLogger("codex_openai_proxy.chat_completions")
 
     messages: list[Any] = body.get("messages", [])
     instructions: str | None = None
@@ -234,11 +235,13 @@ def _from_openai_message(role: str, content: Any) -> dict[str, Any]:
                 # Convert OpenAI image_url format to Codex input_image format
                 image_url_val = item.get("image_url", {})
                 url = image_url_val.get("url", "") if isinstance(image_url_val, dict) else image_url_val
-                if isinstance(url, str) and url.startswith("data:"):
-                    # base64 data URL: "data:image/png;base64,<data>"
-                    codex_content.append({"type": "input_image", "image_url": url})
-                elif isinstance(url, str):
-                    codex_content.append({"type": "input_image", "image_url": url})
+                if isinstance(url, str) and not url.startswith("data:"):
+                    logger.warning(
+                        "image_url with remote URL '%s...' may not be supported by Codex backend"
+                        " -- only base64 data URLs are guaranteed to work (data:image/...;base64,...)",
+                        url[:60],
+                    )
+                codex_content.append({"type": "input_image", "image_url": url})
             else:
                 # Unknown part type -- try to preserve text if available
                 text_val = item.get("text")
