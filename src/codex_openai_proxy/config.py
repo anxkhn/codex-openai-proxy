@@ -69,6 +69,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
+    inbound_bearer_token: str | None
     oauth_client_id: str
     oauth_authorize_url: str
     oauth_token_url: str
@@ -85,6 +86,7 @@ class Settings:
     upstream_models_client_version: str
     request_timeout_seconds: float
     auto_default_instructions: bool
+    image_controller_model: str
 
 
 @lru_cache(maxsize=1)
@@ -100,6 +102,7 @@ def get_settings() -> Settings:
     default_user_agent = _build_codex_user_agent(oauth_originator, codex_version)
 
     return Settings(
+        inbound_bearer_token=os.getenv("CODEX_PROXY_INBOUND_BEARER_TOKEN") or None,
         oauth_client_id=os.getenv("CODEX_PROXY_CLIENT_ID", DEFAULT_CODEX_CLIENT_ID),
         oauth_authorize_url=os.getenv(
             "CODEX_PROXY_OAUTH_AUTHORIZE_URL", "https://auth.openai.com/oauth/authorize"
@@ -122,4 +125,5 @@ def get_settings() -> Settings:
         upstream_models_client_version=os.getenv("CODEX_PROXY_MODELS_CLIENT_VERSION", "1.0.0"),
         request_timeout_seconds=float(os.getenv("CODEX_PROXY_REQUEST_TIMEOUT_SECONDS", "45")),
         auto_default_instructions=_env_bool("CODEX_PROXY_AUTO_DEFAULT_INSTRUCTIONS", False),
+        image_controller_model=os.getenv("CODEX_PROXY_IMAGE_CONTROLLER_MODEL", "gpt-5.6-luna"),
     )
