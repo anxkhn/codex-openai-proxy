@@ -1,23 +1,124 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Any
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Mapping
+import asyncio
 import base64
+import hashlib
 import json
 import hmac
 import logging
+import secrets
+import shutil
 import time
 
-from fastapi import Body, FastAPI, File, Form, Query, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, Query, Request, UploadFile, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from codex_openai_proxy.auth.service import AuthNotConfiguredError, AuthService
 from codex_openai_proxy.auth.store import AuthStore
 from codex_openai_proxy.codex.client import CodexUpstreamClient, iter_streaming_body
 from codex_openai_proxy.codex.rate_limits import RateLimitState
+from codex_openai_proxy.codex.realtime import CodexRealtimeSession
+from codex_openai_proxy.codex.transcription import TranscriptionError, TranscriptionService
 from codex_openai_proxy.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+access_logger = logging.getLogger("uvicorn.error")
+
+
+def _request_log_record(
+    *,
+    headers: Mapping[str, str],
+    method: str,
+    path: str,
+    status_code: int,
+    duration_ms: float,
+) -> dict[str, Any]:
+    """Build a structured access-log record with Cloudflare correlation IDs."""
+    return {
+        "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "method": method,
+        "path": path,
+        "status_code": status_code,
+        "duration_ms": round(duration_ms, 3),
+        # Cf-Ray is Cloudflare's request identifier at the origin. AI Gateway
+        # identifiers are retained too when Cloudflare forwards them.
+        "cf_ray": headers.get("cf-ray"),
+        "cf_aig_event_id": headers.get("cf-aig-event-id"),
+        "cf_aig_log_id": headers.get("cf-aig-log-id"),
+        "x_request_id": headers.get("x-request-id"),
+    }
+
+
+def _openai_error(
+    status_code: int,
+    message: str,
+    *,
+    param: str | None = None,
+    code: str | None = None,
+    error_type: str = "invalid_request_error",
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": param,
+                "code": code,
+            }
+        },
+    )
+
+
+def _valid_inbound_bearer(authorization: str, expected: str | None) -> bool:
+    if not expected:
+        return False
+    scheme, _, presented = authorization.partition(" ")
+    return bool(
+        scheme.lower() == "bearer" and presented and hmac.compare_digest(presented, expected)
+    )
+
+
+REALTIME_TOKEN_TTL_SECONDS = 60
+
+
+class RealtimeTokenStore:
+    """Process-local, one-use credentials for the realtime WebSocket only."""
+
+    def __init__(self, *, ttl_seconds: int = REALTIME_TOKEN_TTL_SECONDS) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._tokens: dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def mint(self) -> tuple[str, int]:
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        now = time.monotonic()
+        async with self._lock:
+            self._discard_expired(now)
+            self._tokens[digest] = now + self.ttl_seconds
+        return token, self.ttl_seconds
+
+    async def consume(self, authorization: str) -> bool:
+        scheme, _, presented = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not presented:
+            return False
+        digest = hashlib.sha256(presented.encode("utf-8")).hexdigest()
+        now = time.monotonic()
+        async with self._lock:
+            self._discard_expired(now)
+            expires_at = self._tokens.pop(digest, None)
+        return expires_at is not None and expires_at > now
+
+    def _discard_expired(self, now: float) -> None:
+        expired = [digest for digest, expires_at in self._tokens.items() if expires_at <= now]
+        for digest in expired:
+            self._tokens.pop(digest, None)
+
 
 DEFAULT_RESPONSES_BODY: dict[str, Any] = {
     "model": "gpt-5",
@@ -478,6 +579,24 @@ async def lifespan(app: FastAPI):
     app.state.auth_service = auth_service
     app.state.rate_limits = rate_limits
     app.state.upstream = upstream
+    app.state.transcription = None
+    app.state.transcription_error = None
+    app.state.realtime_slots = asyncio.Semaphore(2)
+    app.state.realtime_tokens = RealtimeTokenStore()
+
+    ffmpeg_path = shutil.which(settings.ffmpeg_executable)
+    if not settings.transcription_enabled:
+        app.state.transcription_error = "Transcription is disabled"
+    elif ffmpeg_path is None:
+        app.state.transcription_error = "FFmpeg executable was not found"
+    else:
+        app.state.transcription = TranscriptionService(
+            upstream,
+            ffmpeg_executable=ffmpeg_path,
+            transcription_url=settings.transcription_url,
+            timeout_seconds=settings.transcription_timeout_seconds,
+            max_concurrency=settings.transcription_max_concurrency,
+        )
 
     try:
         yield
@@ -499,18 +618,31 @@ def create_app() -> FastAPI:
         token = settings.inbound_bearer_token
         if token and request.url.path.startswith("/v1/"):
             authorization = request.headers.get("authorization", "")
-            scheme, _, presented = authorization.partition(" ")
-            if (
-                scheme.lower() != "bearer"
-                or not presented
-                or not hmac.compare_digest(presented, token)
-            ):
+            if not _valid_inbound_bearer(authorization, token):
                 return JSONResponse(
                     status_code=401,
                     content={"error": {"message": "Valid bearer authentication is required."}},
                     headers={"WWW-Authenticate": "Bearer"},
                 )
         return await call_next(request)
+
+    @app.middleware("http")
+    async def log_request(request: Request, call_next):
+        started = time.perf_counter()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            record = _request_log_record(
+                headers=request.headers,
+                method=request.method,
+                path=request.url.path,
+                status_code=status_code,
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+            access_logger.info("access %s", json.dumps(record, separators=(",", ":")))
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> str:
@@ -652,14 +784,65 @@ def create_app() -> FastAPI:
 """
 
     @app.get("/health")
-    async def health(request: Request) -> dict[str, Any]:
+    async def health(request: Request) -> JSONResponse:
         auth_service: AuthService = request.app.state.auth_service
-        record = auth_service.get_record()
-        return {
-            "ok": True,
-            "authenticated": record is not None,
+        authentication_error: str | None = None
+        try:
+            # A stored OAuth record is not sufficient: access and refresh tokens
+            # can be expired or revoked.  Use the same validation path as real
+            # upstream requests so health reports readiness accurately.
+            await auth_service.get_authorization()
+        except AuthNotConfiguredError as exc:
+            authentication_error = str(exc)
+        except Exception:
+            logger.exception("Upstream authentication health check failed")
+            authentication_error = "Upstream authentication check failed."
+
+        authenticated = authentication_error is None
+        transcription_ready = request.app.state.transcription is not None
+        payload = {
+            "ok": authenticated and transcription_ready,
+            "authenticated": authenticated,
+            "authentication": {"ready": authenticated, "detail": authentication_error},
             "upstream_base_url": request.app.state.settings.upstream_base_url,
             "billing_mode": "codex_oauth_subscription",
+            "transcription": {
+                "ready": transcription_ready,
+                "experimental": True,
+                "detail": request.app.state.transcription_error,
+            },
+        }
+        return JSONResponse(status_code=200 if payload["ok"] else 503, content=payload)
+
+    @app.websocket("/v1/realtime/codex")
+    async def codex_realtime(websocket: WebSocket) -> None:
+        """Restricted bridge to Codex app-server's experimental v3 WebRTC Realtime API."""
+        settings: Settings = websocket.app.state.settings
+        authorization = websocket.headers.get("authorization", "")
+        permanent_bearer = _valid_inbound_bearer(authorization, settings.inbound_bearer_token)
+        ephemeral_bearer = False
+        if not permanent_bearer:
+            ephemeral_bearer = await websocket.app.state.realtime_tokens.consume(authorization)
+        if not permanent_bearer and not ephemeral_bearer:
+            await websocket.close(code=1008, reason="Valid bearer authentication is required.")
+            return
+
+        slots = websocket.app.state.realtime_slots
+        if slots.locked():
+            await websocket.close(code=1013, reason="Realtime capacity is currently full.")
+            return
+        async with slots:
+            session = CodexRealtimeSession(websocket, cwd=str(Path.cwd()))
+            await session.run()
+
+    @app.post("/v1/realtime/token")
+    async def mint_realtime_token(request: Request) -> dict[str, Any]:
+        """Mint a one-use bearer accepted only by the realtime WebSocket."""
+        token, expires_in = await request.app.state.realtime_tokens.mint()
+        return {
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
         }
 
     @app.get("/favicon.ico", include_in_schema=False)
@@ -714,6 +897,84 @@ def create_app() -> FastAPI:
             )
         normalized = _normalize_models(payload)
         return JSONResponse(status_code=200, content=normalized, headers=passthrough)
+
+    @app.post("/v1/audio/transcriptions")
+    async def audio_transcriptions(
+        request: Request,
+        file: UploadFile = File(...),
+        model: str = Form(...),
+        language: str | None = Form(default=None),
+        prompt: str | None = Form(default=None),
+        response_format: str = Form(default="json"),
+        temperature: float = Form(default=0.0),
+    ):
+        if model != "whisper-1":
+            return _openai_error(
+                400,
+                "Only the compatibility model 'whisper-1' is supported.",
+                param="model",
+                code="model_not_found",
+            )
+        if response_format not in {"json", "text"}:
+            return _openai_error(
+                400,
+                "response_format must be 'json' or 'text'; timestamped formats are not supported.",
+                param="response_format",
+                code="unsupported_response_format",
+            )
+        if temperature < 0 or temperature > 1:
+            return _openai_error(
+                400,
+                "temperature must be between 0 and 1.",
+                param="temperature",
+                code="invalid_value",
+            )
+        service: TranscriptionService | None = request.app.state.transcription
+        if service is None:
+            return _openai_error(
+                503,
+                request.app.state.transcription_error or "Transcription is unavailable.",
+                code="transcription_unavailable",
+                error_type="server_error",
+            )
+
+        limit = request.app.state.settings.transcription_max_upload_bytes
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := await file.read(1024 * 1024):
+            size += len(chunk)
+            if size > limit:
+                return _openai_error(
+                    413,
+                    f"Audio file exceeds the {limit}-byte upload limit.",
+                    param="file",
+                    code="file_too_large",
+                )
+            chunks.append(chunk)
+        if size == 0:
+            return _openai_error(400, "Audio file is empty.", param="file", code="invalid_file")
+
+        try:
+            text = await service.transcribe(
+                b"".join(chunks), language=language or None, prompt=prompt or None
+            )
+        except TranscriptionError as exc:
+            logger.warning("Transcription failed: %s", exc)
+            message = str(exc)
+            invalid_audio = message.startswith(("Invalid or unsupported", "Audio contains"))
+            status = exc.upstream_status or (400 if invalid_audio else 502)
+            client_error = 400 <= status < 500
+            return _openai_error(
+                status,
+                message,
+                param="file" if invalid_audio else None,
+                code="invalid_audio" if invalid_audio else "transcription_failed",
+                error_type="invalid_request_error" if client_error else "server_error",
+            )
+
+        if response_format == "text":
+            return Response(content=text, media_type="text/plain; charset=utf-8")
+        return JSONResponse(content={"text": text})
 
     @app.post("/v1/images/generations")
     async def image_generations(

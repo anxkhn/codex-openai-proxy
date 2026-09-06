@@ -80,6 +80,8 @@ class Settings:
     oauth_originator: str
     oauth_scopes: tuple[str, ...]
     auth_file_path: Path
+    codex_auth_file_path: Path | None
+    auto_import_codex_auth: bool
     upstream_base_url: str
     upstream_user_agent: str
     upstream_version: str
@@ -87,6 +89,12 @@ class Settings:
     request_timeout_seconds: float
     auto_default_instructions: bool
     image_controller_model: str
+    transcription_enabled: bool
+    ffmpeg_executable: str
+    transcription_url: str
+    transcription_max_upload_bytes: int
+    transcription_timeout_seconds: float
+    transcription_max_concurrency: int
 
 
 @lru_cache(maxsize=1)
@@ -117,6 +125,12 @@ def get_settings() -> Settings:
         oauth_originator=oauth_originator,
         oauth_scopes=oauth_scopes,
         auth_file_path=auth_file_path,
+        codex_auth_file_path=(
+            Path(os.environ["CODEX_PROXY_CODEX_AUTH_FILE"])
+            if os.getenv("CODEX_PROXY_CODEX_AUTH_FILE")
+            else (home / ".codex" / "auth.json")
+        ),
+        auto_import_codex_auth=_env_bool("CODEX_PROXY_AUTO_IMPORT_CODEX_AUTH", True),
         upstream_base_url=os.getenv(
             "CODEX_PROXY_UPSTREAM_BASE_URL", "https://chatgpt.com/backend-api/codex"
         ),
@@ -126,4 +140,18 @@ def get_settings() -> Settings:
         request_timeout_seconds=float(os.getenv("CODEX_PROXY_REQUEST_TIMEOUT_SECONDS", "45")),
         auto_default_instructions=_env_bool("CODEX_PROXY_AUTO_DEFAULT_INSTRUCTIONS", False),
         image_controller_model=os.getenv("CODEX_PROXY_IMAGE_CONTROLLER_MODEL", "gpt-5.6-luna"),
+        transcription_enabled=_env_bool("CODEX_PROXY_TRANSCRIPTION_ENABLED", True),
+        ffmpeg_executable=os.getenv("CODEX_PROXY_FFMPEG_EXECUTABLE", "ffmpeg"),
+        transcription_url=os.getenv(
+            "CODEX_PROXY_TRANSCRIPTION_URL", "https://chatgpt.com/backend-api/transcribe"
+        ),
+        transcription_max_upload_bytes=int(
+            os.getenv("CODEX_PROXY_TRANSCRIPTION_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024))
+        ),
+        transcription_timeout_seconds=float(
+            os.getenv("CODEX_PROXY_TRANSCRIPTION_TIMEOUT_SECONDS", "180")
+        ),
+        transcription_max_concurrency=max(
+            1, int(os.getenv("CODEX_PROXY_TRANSCRIPTION_MAX_CONCURRENCY", "2"))
+        ),
     )

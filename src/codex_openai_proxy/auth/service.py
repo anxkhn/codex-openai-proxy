@@ -188,6 +188,17 @@ class AuthService:
         return Authorization(access_token=token, account_id=account_id)
 
     async def ensure_valid_access_token(self, min_validity_seconds: int = 60) -> str:
+        try:
+            return await self._ensure_valid_access_token(min_validity_seconds)
+        except Exception:
+            # The proxy auth file may contain a revoked/expired refresh token
+            # while the Codex CLI has already refreshed its own auth file.  Try
+            # one import-and-retry fallback, then preserve the final failure.
+            if not await self._try_import_codex_auth_fallback():
+                raise
+            return await self._ensure_valid_access_token(min_validity_seconds)
+
+    async def _ensure_valid_access_token(self, min_validity_seconds: int) -> str:
         record = self.store.load()
         if record is None:
             raise AuthNotConfiguredError(
@@ -201,6 +212,19 @@ class AuthService:
         if refreshed is None:
             raise AuthNotConfiguredError("Auth record missing after refresh")
         return refreshed.access_token
+
+    async def _try_import_codex_auth_fallback(self) -> bool:
+        source_path = self.settings.codex_auth_file_path
+        if not self.settings.auto_import_codex_auth or source_path is None:
+            return False
+        if not source_path.exists() or source_path.resolve() == self.settings.auth_file_path.resolve():
+            return False
+        async with self._refresh_lock:
+            try:
+                self.import_from_codex_auth_file(source_path)
+                return True
+            except Exception:
+                return False
 
     async def refresh_access_token(self, force: bool) -> None:
         async with self._refresh_lock:
